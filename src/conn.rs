@@ -17,8 +17,8 @@ use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Transact, Update};
 
 use crate::storage::kv::DocOps;
-use crate::storage::lmdb::LmdbStore;
-use redis::aio::Connection as RedisConnection;
+use crate::storage::sqlite::SqliteStore;
+use redis::aio::MultiplexedConnection as RedisConnection;
 use redis::AsyncCommands;
 
 /// Connection configuration options
@@ -33,22 +33,12 @@ pub struct ConnectionConfig {
 }
 
 /// Redis cache configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RedisConfig {
     /// Redis URL
     pub url: String,
     /// Cache TTL in seconds
     pub ttl: u64,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            storage_enabled: false,
-            doc_name: None,
-            redis_config: None,
-        }
-    }
 }
 
 /// Connection handler over a pair of message streams, which implements a Yjs/Yrs awareness and
@@ -138,7 +128,7 @@ where
         awareness: Arc<RwLock<Awareness>>,
         sink: Sink,
         stream: Stream,
-        store: Arc<LmdbStore<'static>>,
+        store: Arc<SqliteStore>,
         config: ConnectionConfig,
     ) -> Self {
         if !config.storage_enabled {
@@ -157,7 +147,7 @@ where
             let client =
                 redis::Client::open(redis_config.url).expect("Failed to create Redis client");
             let conn = client
-                .get_async_connection()
+                .get_multiplexed_async_connection()
                 .await
                 .expect("Failed to connect to Redis");
             Some(Arc::new(Mutex::new(conn)))
@@ -170,7 +160,7 @@ where
             let mut conn = redis.lock().await;
             let cache_key = format!("doc:{}", doc_name);
             if let Ok(cached_data) = conn.get::<_, Vec<u8>>(&cache_key).await {
-                let mut awareness_guard = awareness.write().await;
+                let awareness_guard = awareness.write().await;
                 let mut txn = awareness_guard.doc().transact_mut();
                 if let Ok(update) = Update::decode_v1(&cached_data) {
                     if let Err(e) = txn.apply_update(update) {
@@ -187,10 +177,26 @@ where
 
         // Load from persistent storage if cache miss
         {
-            let mut awareness = awareness.write().await;
+            let awareness = awareness.write().await;
             let mut txn = awareness.doc().transact_mut();
-            if let Err(e) = store.load_doc(&doc_name, &mut txn).await {
-                tracing::error!("Failed to load document state: {}", e);
+            tracing::info!(
+                "Attempting to load document '{}' from persistent storage",
+                &doc_name
+            );
+            match store.load_doc(&doc_name, &mut txn).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Successfully loaded document '{}' from persistent storage",
+                        &doc_name
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to load document '{}' from persistent storage: {}",
+                        &doc_name,
+                        e
+                    );
+                }
             }
         }
 
@@ -214,23 +220,75 @@ where
         };
 
         // Handle updates using spawn_local instead of spawn
-        tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             while let Some(update) = rx.recv().await {
+                tracing::debug!(
+                    "Received update for doc '{}', size: {} bytes",
+                    doc_name_clone,
+                    update.len()
+                );
+
                 // Store in persistent storage
-                if let Err(e) = store_clone.push_update(&doc_name_clone, &update).await {
-                    tracing::error!("Failed to store update: {}", e);
+                tracing::info!(
+                    "Attempting to store update for doc '{}', size: {} bytes",
+                    doc_name_clone,
+                    update.len()
+                );
+
+                match store_clone
+                    .push_update(doc_name_clone.as_str(), &update)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Successfully stored update for doc '{}', size: {} bytes",
+                            doc_name_clone,
+                            update.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to store update for doc '{}': {}",
+                            doc_name_clone,
+                            e
+                        );
+                        // 可以考虑添加重试逻辑
+                    }
                 }
 
                 // Update Redis cache if enabled
-                if let Some(redis) = &redis_clone {
+                if let Some(redis) = redis_clone.clone() {
                     if let Some(ttl) = redis_ttl {
                         let mut conn = redis.lock().await;
                         let cache_key = format!("doc:{}", doc_name_clone);
-                        if let Err(e) = conn
-                            .set_ex::<_, _, String>(&cache_key, update.as_slice(), ttl)
+                        tracing::info!(
+                            "Attempting to update Redis cache for key '{}', size: {} bytes",
+                            cache_key,
+                            update.len()
+                        );
+
+                        match conn
+                            .set_ex::<_, _, String>(
+                                &cache_key,
+                                update.as_slice(),
+                                ttl.try_into().unwrap(),
+                            )
                             .await
                         {
-                            tracing::error!("Failed to update Redis cache: {}", e);
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Successfully updated Redis cache for key '{}', size: {} bytes",
+                                    cache_key,
+                                    update.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to update Redis cache for key '{}': {}",
+                                    cache_key,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -319,7 +377,7 @@ where
             processing_loop,
             awareness,
             inbox,
-            _stream: PhantomData::default(),
+            _stream: PhantomData,
             _storage_sub: StorageSubscription::default(),
             redis: None,
         }
@@ -335,7 +393,7 @@ where
         let reader = MessageReader::new(&mut decoder);
         for r in reader {
             let msg = r?;
-            if let Some(reply) = handle_msg(protocol, &awareness, msg).await? {
+            if let Some(reply) = handle_msg(protocol, awareness, msg).await? {
                 let mut sender = sink.lock().await;
                 if let Err(e) = sender.send(reply.encode_v1()).await {
                     tracing::error!("Connection failed to send back the reply");
@@ -375,12 +433,12 @@ pub async fn handle_msg<P: Protocol>(
                 protocol.handle_sync_step1(&awareness, sv)
             }
             SyncMessage::SyncStep2(update) => {
-                let mut awareness = a.write().await;
-                protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?)
+                let awareness = a.write().await;
+                protocol.handle_sync_step2(&awareness, Update::decode_v1(&update)?)
             }
             SyncMessage::Update(update) => {
-                let mut awareness = a.write().await;
-                protocol.handle_update(&mut awareness, Update::decode_v1(&update)?)
+                let awareness = a.write().await;
+                protocol.handle_update(&awareness, Update::decode_v1(&update)?)
             }
         },
         Message::Auth(reason) => {
@@ -393,11 +451,11 @@ pub async fn handle_msg<P: Protocol>(
         }
         Message::Awareness(update) => {
             let mut awareness = a.write().await;
-            protocol.handle_awareness_update(&mut awareness, update)
+            protocol.handle_awareness_update(&awareness, update)
         }
         Message::Custom(tag, data) => {
             let mut awareness = a.write().await;
-            protocol.missing_handle(&mut awareness, tag, data)
+            protocol.missing_handle(&awareness, tag, data)
         }
     }
 }
