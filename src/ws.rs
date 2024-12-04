@@ -1,9 +1,10 @@
+use crate::broadcast::BroadcastGroup;
 use crate::conn::Connection;
-use crate::AwarenessRef;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use yrs::sync::Error;
 
@@ -13,9 +14,9 @@ use yrs::sync::Error;
 pub struct WarpConn(Connection<WarpSink, WarpStream>);
 
 impl WarpConn {
-    pub fn new(awareness: AwarenessRef, socket: WebSocket) -> Self {
+    pub fn new(broadcast_group: Arc<BroadcastGroup>, socket: WebSocket) -> Self {
         let (sink, stream) = socket.split();
-        let conn = Connection::new(awareness, WarpSink(sink), WarpStream(stream));
+        let conn = Connection::new(broadcast_group, WarpSink(sink), WarpStream(stream));
         WarpConn(conn)
     }
 }
@@ -24,11 +25,7 @@ impl core::future::Future for WarpConn {
     type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.0).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Other(e.into()))),
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-        }
+        Pin::new(&mut self.0).poll(cx)
     }
 }
 
@@ -41,9 +38,9 @@ impl From<SplitSink<WebSocket, Message>> for WarpSink {
     }
 }
 
-impl Into<SplitSink<WebSocket, Message>> for WarpSink {
-    fn into(self) -> SplitSink<WebSocket, Message> {
-        self.0
+impl From<WarpSink> for SplitSink<WebSocket, Message> {
+    fn from(val: WarpSink) -> Self {
+        val.0
     }
 }
 
@@ -92,9 +89,9 @@ impl From<SplitStream<WebSocket>> for WarpStream {
     }
 }
 
-impl Into<SplitStream<WebSocket>> for WarpStream {
-    fn into(self) -> SplitStream<WebSocket> {
-        self.0
+impl From<WarpStream> for SplitStream<WebSocket> {
+    fn from(val: WarpStream) -> Self {
+        val.0
     }
 }
 
@@ -106,7 +103,14 @@ impl Stream for WarpStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(res)) => match res {
-                Ok(msg) => Poll::Ready(Some(Ok(msg.into_data()))),
+                Ok(msg) => match msg {
+                    Message::Binary(data) => Poll::Ready(Some(Ok(data))),
+                    Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Close(_) => {
+                        // 忽略非二进制消息，继续等待下一个消息
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                },
                 Err(e) => Poll::Ready(Some(Err(Error::Other(e.into())))),
             },
         }

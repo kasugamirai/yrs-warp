@@ -19,9 +19,9 @@ const STATIC_FILES_DIR: &str = "examples/code-mirror/frontend/dist";
 const DB_PATH: &str = "examples/code-mirror/yrs.db";
 const DOC_NAME: &str = "codemirror";
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Initialize tracing subscriber
+    // Initialize tracing subscriber with more detailed logging
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_file(true)
@@ -78,7 +78,7 @@ async fn main() {
     tracing::info!("Broadcast group initialized");
 
     let app = Router::new()
-        .route("/my-room", get(ws_handler))
+        .route("/01jdh26362ytz3dkj0dsz9bw7k:main", get(ws_handler))
         .nest_service("/", ServeDir::new(STATIC_FILES_DIR))
         .with_state((bcast, store));
 

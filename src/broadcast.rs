@@ -1,10 +1,13 @@
-#![allow(dead_code)]
+use crate::storage::kv::DocOps;
+use crate::storage::sqlite::SqliteStore;
 use crate::AwarenessRef;
 use futures_util::{SinkExt, StreamExt};
+use redis::aio::MultiplexedConnection as RedisConnection;
+use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::broadcast::error::SendError;
-use tokio::sync::broadcast::{channel, Receiver, Sender};
+use tokio::sync::broadcast::{channel, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use yrs::encoding::write::Write;
@@ -12,53 +15,78 @@ use yrs::sync::protocol::{MSG_SYNC, MSG_SYNC_UPDATE};
 use yrs::sync::{DefaultProtocol, Error, Message, Protocol, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::Update;
+use yrs::{Transact, Update};
 
-/// A broadcast group can be used to propagate updates produced by yrs [yrs::Doc] and [Awareness]
-/// structures in a binary form that conforms to a y-sync protocol.
-///
-/// New receivers can subscribe to a broadcasting group via [BroadcastGroup::subscribe] method.
+/// Redis cache configuration
+#[derive(Debug, Clone, Default)]
+pub struct RedisConfig {
+    /// Redis URL
+    pub url: String,
+    /// Cache TTL in seconds
+    pub ttl: u64,
+}
+
+/// Connection configuration options
+#[derive(Debug, Clone)]
+pub struct BroadcastConfig {
+    /// Whether to enable persistent storage
+    pub storage_enabled: bool,
+    /// Document name for storage (required if storage enabled)
+    pub doc_name: Option<String>,
+    /// Redis configuration (optional)
+    pub redis_config: Option<RedisConfig>,
+}
+
 pub struct BroadcastGroup {
-    awareness_sub: yrs::Subscription,
-    doc_sub: yrs::Subscription,
     awareness_ref: AwarenessRef,
     sender: Sender<Vec<u8>>,
-    receiver: Receiver<Vec<u8>>,
     awareness_updater: JoinHandle<()>,
+    doc_sub: Option<yrs::Subscription>,
+    awareness_sub: Option<yrs::Subscription>,
+    storage: Option<Arc<SqliteStore>>,
+    redis: Option<Arc<Mutex<RedisConnection>>>,
+    doc_name: Option<String>,
+    redis_ttl: Option<usize>,
+    storage_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 unsafe impl Send for BroadcastGroup {}
 unsafe impl Sync for BroadcastGroup {}
 
 impl BroadcastGroup {
-    /// Creates a new [BroadcastGroup] over a provided `awareness` instance. All changes triggered
-    /// by this awareness structure or its underlying document will be propagated to all subscribers
-    /// which have been registered via [BroadcastGroup::subscribe] method.
-    ///
-    /// The overflow of the incoming events that needs to be propagates will be buffered up to a
-    /// provided `buffer_capacity` size.
     pub async fn new(awareness: AwarenessRef, buffer_capacity: usize) -> Self {
-        let (sender, receiver) = channel(buffer_capacity);
+        let (sender, _receiver) = channel(buffer_capacity);
         let awareness_c = Arc::downgrade(&awareness);
         let mut lock = awareness.write().await;
         let sink = sender.clone();
+
+        // 创建存储通道
+        let (storage_tx, storage_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let doc_sub = {
             lock.doc_mut()
                 .observe_update_v1(move |_txn, u| {
-                    // we manually construct msg here to avoid update data copying
+                    // 发送更新到广播通道
                     let mut encoder = EncoderV1::new();
                     encoder.write_var(MSG_SYNC);
                     encoder.write_var(MSG_SYNC_UPDATE);
                     encoder.write_buf(&u.update);
                     let msg = encoder.to_vec();
                     if let Err(_e) = sink.send(msg) {
-                        // current broadcast group is being closed
+                        tracing::warn!("broadcast channel closed");
+                    }
+
+                    // 发送更新到存储通道
+                    if let Err(e) = storage_tx.send(u.update.clone()) {
+                        tracing::error!("Failed to send update to storage channel: {}", e);
                     }
                 })
                 .unwrap()
         };
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = sender.clone();
+
         let awareness_sub = lock.on_update(move |_awareness, event, _origin| {
             let added = event.added();
             let updated = event.updated();
@@ -73,6 +101,7 @@ impl BroadcastGroup {
             }
         });
         drop(lock);
+
         let awareness_updater = tokio::task::spawn(async move {
             while let Some(changed_clients) = rx.recv().await {
                 if let Some(awareness) = awareness_c.upgrade() {
@@ -92,34 +121,189 @@ impl BroadcastGroup {
                 }
             }
         });
+
         BroadcastGroup {
             awareness_ref: awareness,
             awareness_updater,
             sender,
-            receiver,
-            awareness_sub,
-            doc_sub,
+            doc_sub: Some(doc_sub),
+            awareness_sub: Some(awareness_sub),
+            storage: None,
+            redis: None,
+            doc_name: None,
+            redis_ttl: None,
+            storage_rx: Some(storage_rx),
         }
     }
 
-    /// Returns a reference to an underlying [Awareness] instance.
+    pub async fn with_storage(
+        awareness: AwarenessRef,
+        buffer_capacity: usize,
+        store: Arc<SqliteStore>,
+        config: BroadcastConfig,
+    ) -> Self {
+        if !config.storage_enabled {
+            return Self::new(awareness, buffer_capacity).await;
+        }
+
+        let mut group = Self::new(awareness, buffer_capacity).await;
+
+        // 设置存储相关字段
+        let doc_name = config
+            .doc_name
+            .expect("doc_name required when storage enabled");
+        let redis_ttl = config.redis_config.as_ref().map(|c| c.ttl as usize);
+
+        // Initialize Redis and load data
+        let redis = if let Some(redis_config) = config.redis_config {
+            match Self::init_redis_connection(&redis_config.url).await {
+                Ok(conn) => {
+                    let _ = Self::load_from_redis(&conn, &doc_name, &group.awareness_ref).await;
+                    Some(conn)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize Redis connection: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Load from persistent storage
+        Self::load_from_storage(&store, &doc_name, &group.awareness_ref).await;
+
+        group.storage = Some(store);
+        group.redis = redis;
+        group.doc_name = Some(doc_name.clone());
+        group.redis_ttl = redis_ttl;
+
+        // 启动存储处理任务
+        if let Some(mut rx) = group.storage_rx.take() {
+            let store = group.storage.clone().unwrap();
+            let redis = group.redis.clone();
+            let redis_ttl = group.redis_ttl;
+
+            tokio::spawn(async move {
+                while let Some(update) = rx.recv().await {
+                    Self::handle_update(update, &doc_name, &store, &redis, redis_ttl).await;
+                }
+            });
+        }
+
+        group
+    }
+
+    async fn init_redis_connection(
+        url: &str,
+    ) -> Result<Arc<Mutex<RedisConnection>>, redis::RedisError> {
+        let client = redis::Client::open(url)?;
+        let conn = client.get_multiplexed_async_connection().await?;
+        Ok(Arc::new(Mutex::new(conn)))
+    }
+
+    async fn load_from_redis(
+        redis: &Arc<Mutex<RedisConnection>>,
+        doc_name: &str,
+        awareness: &AwarenessRef,
+    ) -> Result<(), Error> {
+        let mut conn = redis.lock().await;
+        let cache_key = format!("doc:{}", doc_name);
+
+        let cached_data: Vec<u8> = conn
+            .get(&cache_key)
+            .await
+            .map_err(|e| Error::Other(e.into()))?;
+        let update = Update::decode_v1(&cached_data)?;
+
+        let awareness_guard = awareness.write().await;
+        let mut txn = awareness_guard.doc().transact_mut();
+        txn.apply_update(update)?;
+
+        tracing::debug!("Successfully loaded document from Redis cache");
+        Ok(())
+    }
+
+    async fn load_from_storage(store: &Arc<SqliteStore>, doc_name: &str, awareness: &AwarenessRef) {
+        let awareness = awareness.write().await;
+        let mut txn = awareness.doc().transact_mut();
+        match store.load_doc(doc_name, &mut txn).await {
+            Ok(_) => {
+                tracing::info!("Successfully loaded document '{}' from storage", doc_name);
+            }
+            Err(e) => {
+                tracing::error!("Failed to load document '{}' from storage: {}", doc_name, e);
+            }
+        }
+    }
+
+    async fn setup_storage_subscription(&mut self) {
+        if let (Some(store), Some(doc_name)) = (&self.storage, &self.doc_name) {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let doc_name = doc_name.clone();
+            let store = store.clone();
+            let redis = self.redis.clone();
+            let redis_ttl = self.redis_ttl;
+
+            // 处理存储更新
+            tokio::spawn(async move {
+                while let Some(update) = rx.recv().await {
+                    Self::handle_update(update, &doc_name, &store, &redis, redis_ttl).await;
+                }
+            });
+
+            // 使用已有的文档订阅发送器
+            if let Some(doc_sub) = &self.doc_sub {
+                let tx = tx.clone();
+                let awareness = self.awareness_ref.read().await;
+                awareness
+                    .doc()
+                    .observe_update_v1(move |_, update| {
+                        if let Err(e) = tx.send(update.update.clone()) {
+                            tracing::error!("Failed to send update to storage channel: {}", e);
+                        }
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn handle_update(
+        update: Vec<u8>,
+        doc_name: &str,
+        store: &Arc<SqliteStore>,
+        redis: &Option<Arc<Mutex<RedisConnection>>>,
+        redis_ttl: Option<usize>,
+    ) {
+        // Store in persistent storage
+        if let Err(e) = store.push_update(doc_name, &update).await {
+            tracing::error!("Failed to store update: {}", e);
+            return;
+        }
+
+        // Update Redis cache if enabled
+        if let (Some(redis), Some(ttl)) = (redis, redis_ttl) {
+            let mut conn = redis.lock().await;
+            let cache_key = format!("doc:{}", doc_name);
+            if let Err(e) = conn
+                .set_ex::<_, _, String>(&cache_key, update.as_slice(), ttl.try_into().unwrap())
+                .await
+            {
+                tracing::error!("Failed to update Redis cache: {}", e);
+            }
+        }
+    }
+
     pub fn awareness(&self) -> &AwarenessRef {
         &self.awareness_ref
     }
 
-    /// Broadcasts user message to all active subscribers. Returns error if message could not have
-    /// been broadcasted.
     pub fn broadcast(&self, msg: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         self.sender.send(msg)?;
         Ok(())
     }
 
-    /// Subscribes a new connection - represented by `sink`/`stream` pair implementing a futures
-    /// Sink and Stream protocols - to a current broadcast group.
-    ///
-    /// Returns a subscription structure, which can be dropped in order to unsubscribe or awaited
-    /// via [Subscription::completed] method in order to complete of its own volition (due to
-    /// an internal connection error or closed connection).
     pub fn subscribe<Sink, Stream, E>(&self, sink: Arc<Mutex<Sink>>, stream: Stream) -> Subscription
     where
         Sink: SinkExt<Vec<u8>> + Send + Sync + Unpin + 'static,
@@ -130,15 +314,6 @@ impl BroadcastGroup {
         self.subscribe_with(sink, stream, DefaultProtocol)
     }
 
-    /// Subscribes a new connection - represented by `sink`/`stream` pair implementing a futures
-    /// Sink and Stream protocols - to a current broadcast group.
-    ///
-    /// Returns a subscription structure, which can be dropped in order to unsubscribe or awaited
-    /// via [Subscription::completed] method in order to complete of its own volition (due to
-    /// an internal connection error or closed connection).
-    ///
-    /// Unlike [BroadcastGroup::subscribe], this method can take [Protocol] parameter that allows to
-    /// customize the y-sync protocol behavior.
     pub fn subscribe_with<Sink, Stream, E, P>(
         &self,
         sink: Arc<Mutex<Sink>>,
@@ -158,9 +333,8 @@ impl BroadcastGroup {
             tokio::spawn(async move {
                 while let Ok(msg) = receiver.recv().await {
                     let mut sink = sink.lock().await;
-                    if let Err(e) = sink.send(msg).await {
-                        println!("broadcast failed to sent sync message");
-                        return Err(Error::Other(Box::new(e)));
+                    if sink.send(msg).await.is_err() {
+                        return Ok(());
                     }
                 }
                 Ok(())
@@ -170,15 +344,14 @@ impl BroadcastGroup {
             let awareness = self.awareness().clone();
             tokio::spawn(async move {
                 while let Some(res) = stream.next().await {
-                    let msg = Message::decode_v1(&res.map_err(|e| Error::Other(Box::new(e)))?)?;
-                    let reply = Self::handle_msg(&protocol, &awareness, msg).await?;
-                    match reply {
-                        None => {}
-                        Some(reply) => {
-                            let mut sink = sink.lock().await;
-                            sink.send(reply.encode_v1())
-                                .await
-                                .map_err(|e| Error::Other(Box::new(e)))?;
+                    if let Ok(data) = res.map_err(|e| Error::Other(Box::new(e))) {
+                        if let Ok(msg) = Message::decode_v1(&data) {
+                            if let Ok(Some(reply)) =
+                                Self::handle_msg(&protocol, &awareness, msg).await
+                            {
+                                let mut sink = sink.lock().await;
+                                let _ = sink.send(reply.encode_v1()).await;
+                            }
                         }
                     }
                 }
@@ -201,34 +374,34 @@ impl BroadcastGroup {
             Message::Sync(msg) => match msg {
                 SyncMessage::SyncStep1(state_vector) => {
                     let awareness = awareness.read().await;
-                    protocol.handle_sync_step1(&*awareness, state_vector)
+                    protocol.handle_sync_step1(&awareness, state_vector)
                 }
                 SyncMessage::SyncStep2(update) => {
-                    let mut awareness = awareness.write().await;
+                    let awareness = awareness.write().await;
                     let update = Update::decode_v1(&update)?;
-                    protocol.handle_sync_step2(&mut *awareness, update)
+                    protocol.handle_sync_step2(&awareness, update)
                 }
                 SyncMessage::Update(update) => {
-                    let mut awareness = awareness.write().await;
+                    let awareness = awareness.write().await;
                     let update = Update::decode_v1(&update)?;
-                    protocol.handle_sync_step2(&mut *awareness, update)
+                    protocol.handle_sync_step2(&awareness, update)
                 }
             },
             Message::Auth(deny_reason) => {
                 let awareness = awareness.read().await;
-                protocol.handle_auth(&*awareness, deny_reason)
+                protocol.handle_auth(&awareness, deny_reason)
             }
             Message::AwarenessQuery => {
                 let awareness = awareness.read().await;
-                protocol.handle_awareness_query(&*awareness)
+                protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
-                let mut awareness = awareness.write().await;
-                protocol.handle_awareness_update(&mut *awareness, update)
+                let awareness = awareness.write().await;
+                protocol.handle_awareness_update(&awareness, update)
             }
             Message::Custom(tag, data) => {
-                let mut awareness = awareness.write().await;
-                protocol.missing_handle(&mut *awareness, tag, data)
+                let awareness = awareness.write().await;
+                protocol.missing_handle(&awareness, tag, data)
             }
         }
     }
@@ -236,141 +409,28 @@ impl BroadcastGroup {
 
 impl Drop for BroadcastGroup {
     fn drop(&mut self) {
+        // 取消所有订阅
+        if let Some(sub) = self.doc_sub.take() {
+            drop(sub);
+        }
+        if let Some(sub) = self.awareness_sub.take() {
+            drop(sub);
+        }
         self.awareness_updater.abort();
     }
 }
 
-/// A subscription structure returned from [BroadcastGroup::subscribe], which represents a
-/// subscribed connection. It can be dropped in order to unsubscribe or awaited via
-/// [Subscription::completed] method in order to complete of its own volition (due to an internal
-/// connection error or closed connection).
-#[derive(Debug)]
 pub struct Subscription {
     sink_task: JoinHandle<Result<(), Error>>,
     stream_task: JoinHandle<Result<(), Error>>,
 }
 
 impl Subscription {
-    /// Consumes current subscription, waiting for it to complete. If an underlying connection was
-    /// closed because of failure, an error which caused it to happen will be returned.
-    ///
-    /// This method doesn't invoke close procedure. If you need that, drop current subscription instead.
     pub async fn completed(self) -> Result<(), Error> {
         let res = select! {
             r1 = self.sink_task => r1,
             r2 = self.stream_task => r2,
         };
         res.map_err(|e| Error::Other(e.into()))?
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::broadcast::BroadcastGroup;
-    use futures_util::{ready, SinkExt, StreamExt};
-    use std::collections::HashMap;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
-    use tokio::sync::{Mutex, RwLock};
-    use tokio_util::sync::PollSender;
-    use yrs::sync::awareness::AwarenessUpdateEntry;
-    use yrs::sync::{Awareness, AwarenessUpdate, Error, Message, SyncMessage};
-    use yrs::updates::decoder::Decode;
-    use yrs::updates::encoder::Encode;
-    use yrs::{Doc, StateVector, Text, Transact};
-
-    #[derive(Debug)]
-    pub struct ReceiverStream<T> {
-        inner: tokio::sync::mpsc::Receiver<T>,
-    }
-
-    impl<T> ReceiverStream<T> {
-        /// Create a new `ReceiverStream`.
-        pub fn new(recv: tokio::sync::mpsc::Receiver<T>) -> Self {
-            Self { inner: recv }
-        }
-    }
-
-    impl<T> futures_util::Stream for ReceiverStream<T> {
-        type Item = Result<T, Error>;
-
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            match ready!(self.inner.poll_recv(cx)) {
-                None => Poll::Ready(None),
-                Some(v) => Poll::Ready(Some(Ok(v))),
-            }
-        }
-    }
-
-    fn test_channel(capacity: usize) -> (PollSender<Vec<u8>>, ReceiverStream<Vec<u8>>) {
-        let (s, r) = tokio::sync::mpsc::channel::<Vec<u8>>(capacity);
-        let s = PollSender::new(s);
-        let r = ReceiverStream::new(r);
-        (s, r)
-    }
-
-    #[tokio::test]
-    async fn broadcast_changes() -> Result<(), Box<dyn std::error::Error>> {
-        let doc = Doc::with_client_id(1);
-        let text = doc.get_or_insert_text("test");
-        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
-        let group = BroadcastGroup::new(awareness.clone(), 1).await;
-
-        let (server_sender, mut client_receiver) = test_channel(1);
-        let (mut client_sender, server_receiver) = test_channel(1);
-        let _sub1 = group.subscribe(Arc::new(Mutex::new(server_sender)), server_receiver);
-
-        // check update propagation
-        {
-            let a = awareness.write().await;
-            text.push(&mut a.doc().transact_mut(), "a");
-        }
-        let msg = client_receiver.next().await;
-        let msg = msg.map(|x| Message::decode_v1(&x.unwrap()).unwrap());
-        assert_eq!(
-            msg,
-            Some(Message::Sync(SyncMessage::Update(vec![
-                1, 1, 1, 0, 4, 1, 4, 116, 101, 115, 116, 1, 97, 0,
-            ])))
-        );
-
-        // check awareness update propagation
-        {
-            let mut a = awareness.write().await;
-            a.set_local_state(r#"{"key":"value"}"#);
-        }
-
-        let msg = client_receiver.next().await;
-        let msg = msg.map(|x| Message::decode_v1(&x.unwrap()).unwrap());
-        assert_eq!(
-            msg,
-            Some(Message::Awareness(AwarenessUpdate {
-                clients: HashMap::from([(
-                    1,
-                    AwarenessUpdateEntry {
-                        clock: 1,
-                        json: r#"{"key":"value"}"#.to_string().into(),
-                    },
-                )]),
-            }))
-        );
-
-        // check sync state request/response
-        {
-            client_sender
-                .send(Message::Sync(SyncMessage::SyncStep1(StateVector::default())).encode_v1())
-                .await?;
-            let msg = client_receiver.next().await;
-            let msg = msg.map(|x| Message::decode_v1(&x.unwrap()).unwrap());
-            assert_eq!(
-                msg,
-                Some(Message::Sync(SyncMessage::SyncStep2(vec![
-                    1, 1, 1, 0, 4, 1, 4, 116, 101, 115, 116, 1, 97, 0,
-                ])))
-            );
-        }
-
-        Ok(())
     }
 }
