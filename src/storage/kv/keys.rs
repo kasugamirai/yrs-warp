@@ -92,7 +92,7 @@ pub fn key_meta(oid: OID, name: &[u8]) -> Key<20> {
     let mut v: SmallVec<[u8; 20]> = smallvec![V1, KEYSPACE_DOC];
     v.write_all(&oid.to_be_bytes()).unwrap();
     v.push(SUB_META);
-    v.write_all(&name).unwrap();
+    v.write_all(name).unwrap();
     v.push(TERMINATOR);
     Key(v)
 }
@@ -144,9 +144,9 @@ impl<const N: usize> AsMut<[u8]> for Key<N> {
     }
 }
 
-impl<const N: usize> Into<Vec<u8>> for Key<N> {
-    fn into(self) -> Vec<u8> {
-        self.0.to_vec()
+impl<const N: usize> From<Key<N>> for Vec<u8> {
+    fn from(val: Key<N>) -> Self {
+        val.0.to_vec()
     }
 }
 

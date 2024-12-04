@@ -24,22 +24,22 @@ impl BroadcastPool {
     }
 
     pub async fn get_or_create_group(&self, doc_id: &str) -> Arc<BroadcastGroup> {
-        // 先尝试获取已存在的广播组
+        // Try to get existing broadcast group first
         if let Some(group) = self.groups.read().await.get(doc_id) {
             return group.clone();
         }
 
-        // 如果不存在，创建新的广播组
+        // If not exists, create new broadcast group
         let mut groups = self.groups.write().await;
         if let Some(group) = groups.get(doc_id) {
             return group.clone();
         }
 
-        // 创建新的文档和广播组
+        // Create new document and broadcast group
         let awareness: AwarenessRef = {
             let doc = Doc::new();
 
-            // 加载文档状态
+            // Load document state
             {
                 let mut txn = doc.transact_mut();
                 match self.store.load_doc(doc_id, &mut txn).await {
@@ -52,7 +52,7 @@ impl BroadcastPool {
                             doc_id,
                             e
                         );
-                        // 初始化新文档
+                        // Initialize new document
                         let txt = doc.get_or_insert_text("codemirror");
                         txt.push(
                             &mut txn,
@@ -68,7 +68,7 @@ impl BroadcastPool {
             Arc::new(RwLock::new(Awareness::new(doc)))
         };
 
-        // 创建新的广播组
+        // Create new broadcast group
         let group = Arc::new(
             BroadcastGroup::with_storage(
                 awareness,
