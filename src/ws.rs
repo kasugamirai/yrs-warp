@@ -103,7 +103,14 @@ impl Stream for WarpStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(res)) => match res {
-                Ok(msg) => Poll::Ready(Some(Ok(msg.into_data()))),
+                Ok(msg) => match msg {
+                    Message::Binary(data) => Poll::Ready(Some(Ok(data))),
+                    Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Close(_) => {
+                        // 忽略非二进制消息，继续等待下一个消息
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                },
                 Err(e) => Poll::Ready(Some(Err(Error::Other(e.into())))),
             },
         }
