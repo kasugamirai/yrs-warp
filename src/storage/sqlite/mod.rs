@@ -12,9 +12,6 @@ pub enum SqliteError {
 
     #[error("Pool error: {0}")]
     Pool(#[from] r2d2::Error),
-
-    #[error("Other error: {0}")]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub struct SqliteStore {

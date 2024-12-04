@@ -20,9 +20,6 @@ use tracing::{debug, info};
 pub enum GcsError {
     #[error("Google API error: {0}")]
     GoogleApi(#[from] google_cloud_storage::http::Error),
-
-    #[error("Other error: {0}")]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Type wrapper around GCS Client struct. Used to extend GCS with [DocOps]

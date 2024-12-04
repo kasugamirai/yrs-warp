@@ -44,7 +44,6 @@ use keys::{
     key_oid, key_state_vector, key_update, Key, KEYSPACE_DOC, KEYSPACE_OID, OID, V1,
 };
 use std::convert::TryInto;
-use tracing::{debug, info};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, TransactionMut, Update};
@@ -237,7 +236,7 @@ where
         };
         let clock = last_clock + 1;
         let update_key = key_update(oid, clock);
-        self.upsert(&update_key, &update).await?;
+        self.upsert(&update_key, update).await?;
         Ok(clock)
     }
 
@@ -279,7 +278,7 @@ where
                 if key > end.as_ref() {
                     break; //TODO: for some reason key range doesn't always work
                 }
-                self.remove(&key).await?;
+                self.remove(key).await?;
             }
         }
         Ok(())
@@ -356,7 +355,7 @@ where
     }
 }
 
-async fn get_oid<'a, DB: DocOps<'a> + ?Sized>(db: &DB, name: &[u8]) -> Result<Option<OID>, Error>
+async fn get_oid<'a, DB: DocOps<'a>>(db: &DB, name: &[u8]) -> Result<Option<OID>, Error>
 where
     Error: From<<DB as KVStore>::Error>,
 {
@@ -371,7 +370,7 @@ where
     }
 }
 
-async fn get_or_create_oid<'a, DB: DocOps<'a> + ?Sized>(db: &DB, name: &[u8]) -> Result<OID, Error>
+async fn get_or_create_oid<'a, DB: DocOps<'a>>(db: &DB, name: &[u8]) -> Result<OID, Error>
 where
     Error: From<<DB as KVStore>::Error>,
 {
@@ -380,8 +379,8 @@ where
     } else {
         let last_oid = if let Some(e) = db.peek_back([V1, KEYSPACE_DOC].as_ref()).await? {
             let value = e.value();
-            let last_value = OID::from_be_bytes(value.try_into().unwrap());
-            last_value
+
+            OID::from_be_bytes(value.try_into().unwrap())
         } else {
             0
         };
@@ -392,7 +391,7 @@ where
     }
 }
 
-async fn load_doc<'doc, 'a, DB: DocOps<'a> + ?Sized>(
+async fn load_doc<'doc, 'a, DB: DocOps<'a>>(
     db: &DB,
     oid: OID,
     txn: &mut TransactionMut<'doc>,
@@ -405,7 +404,7 @@ where
         let doc_key = key_doc(oid);
         if let Some(doc_state) = db.get(&doc_key).await? {
             let update = Update::decode_v1(doc_state.as_ref())?;
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
             found = true;
         }
     }
@@ -413,11 +412,11 @@ where
     {
         let update_key_start = key_update(oid, 0);
         let update_key_end = key_update(oid, u32::MAX);
-        let mut iter = db.iter_range(&update_key_start, &update_key_end).await?;
-        while let Some(e) = iter.next() {
+        let iter = db.iter_range(&update_key_start, &update_key_end).await?;
+        for e in iter {
             let value = e.value();
             let update = Update::decode_v1(value)?;
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
             update_count += 1;
         }
     }
@@ -427,7 +426,7 @@ where
     Ok(update_count)
 }
 
-async fn delete_updates<'a, DB: DocOps<'a> + ?Sized>(db: &DB, oid: OID) -> Result<(), Error>
+async fn delete_updates<'a, DB: DocOps<'a>>(db: &DB, oid: OID) -> Result<(), Error>
 where
     Error: From<<DB as KVStore>::Error>,
 {
@@ -437,7 +436,7 @@ where
     Ok(())
 }
 
-async fn flush_doc<'a, DB: DocOps<'a> + ?Sized>(
+async fn flush_doc<'a, DB: DocOps<'a>>(
     db: &DB,
     oid: OID,
     options: yrs::Options,
@@ -461,7 +460,7 @@ where
     }
 }
 
-async fn insert_inner_v1<'a, DB: DocOps<'a> + ?Sized>(
+async fn insert_inner_v1<'a, DB: DocOps<'a>>(
     db: &DB,
     oid: OID,
     doc_state_v1: &[u8],
