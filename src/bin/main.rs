@@ -6,18 +6,18 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 use yrs::sync::Awareness;
 use yrs::{Doc, Text, Transact};
-use yrs_warp::broadcast::{BroadcastConfig, BroadcastGroup};
+use yrs_warp::broadcast::{BroadcastConfig, BroadcastGroup, RedisConfig};
 use yrs_warp::storage::kv::DocOps;
 use yrs_warp::storage::sqlite::SqliteStore;
 use yrs_warp::ws::WarpConn;
 use yrs_warp::AwarenessRef;
 
-const STATIC_FILES_DIR: &str = "examples/code-mirror/frontend/dist";
 const DB_PATH: &str = "examples/code-mirror/yrs.db";
 const DOC_NAME: &str = "codemirror";
+const REDIS_URL: &str = "redis://127.0.0.1:6379";
+const REDIS_TTL: u64 = 3600; // Cache TTL in seconds
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -61,7 +61,13 @@ async fn main() {
         Arc::new(RwLock::new(Awareness::new(doc)))
     };
 
-    // open a broadcast group that listens to awareness and document updates
+    // Configure Redis for the broadcast group
+    let redis_config = RedisConfig {
+        url: REDIS_URL.to_string(),
+        ttl: REDIS_TTL,
+    };
+
+    // Update the broadcast group initialization with Redis config
     let bcast = Arc::new(
         BroadcastGroup::with_storage(
             awareness.clone(),
@@ -70,16 +76,15 @@ async fn main() {
             BroadcastConfig {
                 storage_enabled: true,
                 doc_name: Some(DOC_NAME.to_string()),
-                redis_config: None,
+                redis_config: Some(redis_config),
             },
         )
         .await,
     );
-    tracing::info!("Broadcast group initialized");
+    tracing::info!("Broadcast group initialized with Redis cache");
 
     let app = Router::new()
         .route("/01jdh26362ytz3dkj0dsz9bw7k:main", get(ws_handler))
-        .nest_service("/", ServeDir::new(STATIC_FILES_DIR))
         .with_state((bcast, store));
 
     tracing::info!("Starting server on 0.0.0.0:8000");
