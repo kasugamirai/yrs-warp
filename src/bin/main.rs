@@ -4,23 +4,23 @@ use axum::{
     routing::get,
     Router,
 };
+use futures::SinkExt;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::services::ServeDir;
 use yrs::sync::Awareness;
 use yrs::{Doc, Text, Transact};
-use yrs_warp::broadcast::BroadcastGroup;
-use yrs_warp::storage::kv::DocOps;
 use yrs_warp::storage::sqlite::SqliteStore;
 use yrs_warp::ws::{WarpSink, WarpStream};
 use yrs_warp::AwarenessRef;
+use yrs_warp::{broadcast::BroadcastGroup, storage::kv::DocOps};
 
 const STATIC_FILES_DIR: &str = "examples/code-mirror/frontend/dist";
 const DB_PATH: &str = "examples/code-mirror/yrs.db";
 const DOC_NAME: &str = "codemirror";
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Initialize tracing subscriber with more detailed logging
     tracing_subscriber::fmt()
@@ -63,11 +63,11 @@ async fn main() {
     };
 
     // open a broadcast group that listens to awareness and document updates
-    let bcast = Arc::new(BroadcastGroup::new(awareness.clone(), 128).await);
+    let bcast = Arc::new(BroadcastGroup::new(awareness.clone(), 32).await);
     tracing::info!("Broadcast group initialized");
 
     let app = Router::new()
-        .route("/my-room", get(ws_handler))
+        .route("/main", get(ws_handler))
         .nest_service("/", ServeDir::new(STATIC_FILES_DIR))
         .with_state((bcast, store));
 
@@ -90,13 +90,30 @@ async fn peer(ws: WebSocket, bcast: Arc<BroadcastGroup>, store: Arc<SqliteStore>
     let (ws_sink, ws_stream) = ws.split();
     let sink = Arc::new(Mutex::new(WarpSink::from(ws_sink)));
     let stream = WarpStream::from(ws_stream);
-    let sub = bcast.subscribe(sink, stream);
-    match sub.completed().await {
-        Ok(_) => {
-            tracing::info!("WebSocket connection closed gracefully");
+
+    let sink2 = sink.clone();
+    let filtered_stream = Box::pin(stream.filter_map(move |msg| {
+        let sink2 = sink2.clone();
+        async move {
+            match msg {
+                Ok(vec) => {
+                    if vec == vec![1] {
+                        let mut sink = sink2.lock().await;
+                        let _ = sink.send(vec![2]).await;
+                        None
+                    } else {
+                        Some(Ok(vec))
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            }
         }
-        Err(e) => {
-            tracing::error!("WebSocket connection error: {}", e);
-        }
+    }));
+
+    let sub = bcast.subscribe(sink, filtered_stream);
+    if let Err(e) = sub.completed().await {
+        eprintln!("broadcasting for channel finished abruptly: {}", e);
+    } else {
+        println!("broadcasting for channel finished successfully");
     }
 }

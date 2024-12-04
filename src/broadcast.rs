@@ -158,9 +158,9 @@ impl BroadcastGroup {
             tokio::spawn(async move {
                 while let Ok(msg) = receiver.recv().await {
                     let mut sink = sink.lock().await;
-                    if let Err(e) = sink.send(msg).await {
-                        println!("broadcast failed to sent sync message");
-                        return Err(Error::Other(Box::new(e)));
+                    if sink.send(msg).await.is_err() {
+                        // 连接已关闭，静默退出
+                        return Ok(());
                     }
                 }
                 Ok(())
@@ -170,15 +170,14 @@ impl BroadcastGroup {
             let awareness = self.awareness().clone();
             tokio::spawn(async move {
                 while let Some(res) = stream.next().await {
-                    let msg = Message::decode_v1(&res.map_err(|e| Error::Other(Box::new(e)))?)?;
-                    let reply = Self::handle_msg(&protocol, &awareness, msg).await?;
-                    match reply {
-                        None => {}
-                        Some(reply) => {
-                            let mut sink = sink.lock().await;
-                            sink.send(reply.encode_v1())
-                                .await
-                                .map_err(|e| Error::Other(Box::new(e)))?;
+                    if let Ok(data) = res.map_err(|e| Error::Other(Box::new(e))) {
+                        if let Ok(msg) = Message::decode_v1(&data) {
+                            if let Ok(Some(reply)) =
+                                Self::handle_msg(&protocol, &awareness, msg).await
+                            {
+                                let mut sink = sink.lock().await;
+                                let _ = sink.send(reply.encode_v1()).await;
+                            }
                         }
                     }
                 }
@@ -201,34 +200,34 @@ impl BroadcastGroup {
             Message::Sync(msg) => match msg {
                 SyncMessage::SyncStep1(state_vector) => {
                     let awareness = awareness.read().await;
-                    protocol.handle_sync_step1(&*awareness, state_vector)
+                    protocol.handle_sync_step1(&awareness, state_vector)
                 }
                 SyncMessage::SyncStep2(update) => {
-                    let mut awareness = awareness.write().await;
+                    let awareness = awareness.write().await;
                     let update = Update::decode_v1(&update)?;
-                    protocol.handle_sync_step2(&mut *awareness, update)
+                    protocol.handle_sync_step2(&awareness, update)
                 }
                 SyncMessage::Update(update) => {
-                    let mut awareness = awareness.write().await;
+                    let awareness = awareness.write().await;
                     let update = Update::decode_v1(&update)?;
-                    protocol.handle_sync_step2(&mut *awareness, update)
+                    protocol.handle_sync_step2(&awareness, update)
                 }
             },
             Message::Auth(deny_reason) => {
                 let awareness = awareness.read().await;
-                protocol.handle_auth(&*awareness, deny_reason)
+                protocol.handle_auth(&awareness, deny_reason)
             }
             Message::AwarenessQuery => {
                 let awareness = awareness.read().await;
-                protocol.handle_awareness_query(&*awareness)
+                protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
-                let mut awareness = awareness.write().await;
-                protocol.handle_awareness_update(&mut *awareness, update)
+                let awareness = awareness.write().await;
+                protocol.handle_awareness_update(&awareness, update)
             }
             Message::Custom(tag, data) => {
-                let mut awareness = awareness.write().await;
-                protocol.missing_handle(&mut *awareness, tag, data)
+                let awareness = awareness.write().await;
+                protocol.missing_handle(&awareness, tag, data)
             }
         }
     }
@@ -338,7 +337,7 @@ mod test {
         // check awareness update propagation
         {
             let mut a = awareness.write().await;
-            a.set_local_state(r#"{"key":"value"}"#);
+            let _ = a.set_local_state(r#"{"key":"value"}"#);
         }
 
         let msg = client_receiver.next().await;
