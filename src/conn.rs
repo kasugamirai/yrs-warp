@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use futures::FutureExt;
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -11,11 +10,13 @@ use yrs::sync::Error;
 
 use crate::broadcast::{BroadcastGroup, Subscription};
 
+type CompletionFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
 /// Connection handler over a pair of message streams, which implements a Yjs/Yrs awareness and
 /// update exchange protocol.
 pub struct Connection<Sink, Stream> {
     broadcast_sub: Option<Subscription>,
-    completion_future: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>,
+    completion_future: Option<CompletionFuture>,
     _sink: PhantomData<Sink>,
     _stream: PhantomData<Stream>,
 }

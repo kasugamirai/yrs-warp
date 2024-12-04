@@ -60,13 +60,12 @@ impl BroadcastGroup {
         let mut lock = awareness.write().await;
         let sink = sender.clone();
 
-        // 创建存储通道
         let (storage_tx, storage_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let doc_sub = {
             lock.doc_mut()
                 .observe_update_v1(move |_txn, u| {
-                    // 发送更新到广播通道
+                    // Send update to broadcast channel
                     let mut encoder = EncoderV1::new();
                     encoder.write_var(MSG_SYNC);
                     encoder.write_var(MSG_SYNC_UPDATE);
@@ -76,7 +75,7 @@ impl BroadcastGroup {
                         tracing::warn!("broadcast channel closed");
                     }
 
-                    // 发送更新到存储通道
+                    // Send update to storage channel
                     if let Err(e) = storage_tx.send(u.update.clone()) {
                         tracing::error!("Failed to send update to storage channel: {}", e);
                     }
@@ -148,7 +147,7 @@ impl BroadcastGroup {
 
         let mut group = Self::new(awareness, buffer_capacity).await;
 
-        // 设置存储相关字段
+        // Set storage-related fields
         let doc_name = config
             .doc_name
             .expect("doc_name required when storage enabled");
@@ -178,7 +177,7 @@ impl BroadcastGroup {
         group.doc_name = Some(doc_name.clone());
         group.redis_ttl = redis_ttl;
 
-        // 启动存储处理任务
+        // Start storage processing task
         if let Some(mut rx) = group.storage_rx.take() {
             let store = group.storage.clone().unwrap();
             let redis = group.redis.clone();
@@ -233,38 +232,6 @@ impl BroadcastGroup {
             }
             Err(e) => {
                 tracing::error!("Failed to load document '{}' from storage: {}", doc_name, e);
-            }
-        }
-    }
-
-    async fn setup_storage_subscription(&mut self) {
-        if let (Some(store), Some(doc_name)) = (&self.storage, &self.doc_name) {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-            let doc_name = doc_name.clone();
-            let store = store.clone();
-            let redis = self.redis.clone();
-            let redis_ttl = self.redis_ttl;
-
-            // 处理存储更新
-            tokio::spawn(async move {
-                while let Some(update) = rx.recv().await {
-                    Self::handle_update(update, &doc_name, &store, &redis, redis_ttl).await;
-                }
-            });
-
-            // 使用已有的文档订阅发送器
-            if let Some(doc_sub) = &self.doc_sub {
-                let tx = tx.clone();
-                let awareness = self.awareness_ref.read().await;
-                awareness
-                    .doc()
-                    .observe_update_v1(move |_, update| {
-                        if let Err(e) = tx.send(update.update.clone()) {
-                            tracing::error!("Failed to send update to storage channel: {}", e);
-                        }
-                    })
-                    .unwrap();
             }
         }
     }
@@ -409,7 +376,7 @@ impl BroadcastGroup {
 
 impl Drop for BroadcastGroup {
     fn drop(&mut self) {
-        // 取消所有订阅
+        // Cancel all subscriptions
         if let Some(sub) = self.doc_sub.take() {
             drop(sub);
         }
