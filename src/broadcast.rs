@@ -47,6 +47,7 @@ pub struct BroadcastGroup {
     redis: Option<Arc<Mutex<RedisConnection>>>,
     doc_name: Option<String>,
     redis_ttl: Option<usize>,
+    storage_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 unsafe impl Send for BroadcastGroup {}
@@ -59,10 +60,13 @@ impl BroadcastGroup {
         let mut lock = awareness.write().await;
         let sink = sender.clone();
 
-        // 文档更新订阅
+        // 创建存储通道
+        let (storage_tx, storage_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let doc_sub = {
             lock.doc_mut()
                 .observe_update_v1(move |_txn, u| {
+                    // 发送更新到广播通道
                     let mut encoder = EncoderV1::new();
                     encoder.write_var(MSG_SYNC);
                     encoder.write_var(MSG_SYNC_UPDATE);
@@ -70,6 +74,11 @@ impl BroadcastGroup {
                     let msg = encoder.to_vec();
                     if let Err(_e) = sink.send(msg) {
                         tracing::warn!("broadcast channel closed");
+                    }
+
+                    // 发送更新到存储通道
+                    if let Err(e) = storage_tx.send(u.update.clone()) {
+                        tracing::error!("Failed to send update to storage channel: {}", e);
                     }
                 })
                 .unwrap()
@@ -123,6 +132,7 @@ impl BroadcastGroup {
             redis: None,
             doc_name: None,
             redis_ttl: None,
+            storage_rx: Some(storage_rx),
         }
     }
 
@@ -138,6 +148,7 @@ impl BroadcastGroup {
 
         let mut group = Self::new(awareness, buffer_capacity).await;
 
+        // 设置存储相关字段
         let doc_name = config
             .doc_name
             .expect("doc_name required when storage enabled");
@@ -164,11 +175,21 @@ impl BroadcastGroup {
 
         group.storage = Some(store);
         group.redis = redis;
-        group.doc_name = Some(doc_name);
+        group.doc_name = Some(doc_name.clone());
         group.redis_ttl = redis_ttl;
 
-        // Set up storage subscription
-        group.setup_storage_subscription().await;
+        // 启动存储处理任务
+        if let Some(mut rx) = group.storage_rx.take() {
+            let store = group.storage.clone().unwrap();
+            let redis = group.redis.clone();
+            let redis_ttl = group.redis_ttl;
+
+            tokio::spawn(async move {
+                while let Some(update) = rx.recv().await {
+                    Self::handle_update(update, &doc_name, &store, &redis, redis_ttl).await;
+                }
+            });
+        }
 
         group
     }
@@ -224,26 +245,6 @@ impl BroadcastGroup {
             let store = store.clone();
             let redis = self.redis.clone();
             let redis_ttl = self.redis_ttl;
-            let sender = self.sender.clone();
-
-            let awareness = self.awareness_ref.read().await;
-            awareness
-                .doc()
-                .observe_update_v1(move |_, update| {
-                    if let Err(e) = tx.send(update.update.clone()) {
-                        tracing::error!("Failed to send update to storage channel: {}", e);
-                    }
-
-                    let mut encoder = EncoderV1::new();
-                    encoder.write_var(MSG_SYNC);
-                    encoder.write_var(MSG_SYNC_UPDATE);
-                    encoder.write_buf(&update.update);
-                    let msg = encoder.to_vec();
-                    if sender.send(msg).is_err() {
-                        tracing::warn!("Failed to broadcast update");
-                    }
-                })
-                .unwrap();
 
             // 处理存储更新
             tokio::spawn(async move {
@@ -251,6 +252,20 @@ impl BroadcastGroup {
                     Self::handle_update(update, &doc_name, &store, &redis, redis_ttl).await;
                 }
             });
+
+            // 使用已有的文档订阅发送器
+            if let Some(doc_sub) = &self.doc_sub {
+                let tx = tx.clone();
+                let awareness = self.awareness_ref.read().await;
+                awareness
+                    .doc()
+                    .observe_update_v1(move |_, update| {
+                        if let Err(e) = tx.send(update.update.clone()) {
+                            tracing::error!("Failed to send update to storage channel: {}", e);
+                        }
+                    })
+                    .unwrap();
+            }
         }
     }
 
