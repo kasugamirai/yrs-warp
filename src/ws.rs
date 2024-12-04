@@ -1,9 +1,10 @@
+use crate::broadcast::BroadcastGroup;
 use crate::conn::Connection;
-use crate::AwarenessRef;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use yrs::sync::Error;
 
@@ -13,9 +14,9 @@ use yrs::sync::Error;
 pub struct WarpConn(Connection<WarpSink, WarpStream>);
 
 impl WarpConn {
-    pub fn new(awareness: AwarenessRef, socket: WebSocket) -> Self {
+    pub fn new(broadcast_group: Arc<BroadcastGroup>, socket: WebSocket) -> Self {
         let (sink, stream) = socket.split();
-        let conn = Connection::new(awareness, WarpSink(sink), WarpStream(stream));
+        let conn = Connection::new(broadcast_group, WarpSink(sink), WarpStream(stream));
         WarpConn(conn)
     }
 }
@@ -24,11 +25,7 @@ impl core::future::Future for WarpConn {
     type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.0).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Other(e.into()))),
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-        }
+        Pin::new(&mut self.0).poll(cx)
     }
 }
 

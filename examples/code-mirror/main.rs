@@ -4,16 +4,15 @@ use axum::{
     routing::get,
     Router,
 };
-use futures_util::StreamExt;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use yrs::sync::Awareness;
 use yrs::{Doc, Text, Transact};
-use yrs_warp::broadcast::BroadcastGroup;
+use yrs_warp::broadcast::{BroadcastConfig, BroadcastGroup};
 use yrs_warp::storage::kv::DocOps;
 use yrs_warp::storage::sqlite::SqliteStore;
-use yrs_warp::ws::{WarpSink, WarpStream};
+use yrs_warp::ws::WarpConn;
 use yrs_warp::AwarenessRef;
 
 const STATIC_FILES_DIR: &str = "examples/code-mirror/frontend/dist";
@@ -22,7 +21,7 @@ const DOC_NAME: &str = "codemirror";
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing subscriber with more detailed logging
+    // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_file(true)
@@ -63,7 +62,19 @@ async fn main() {
     };
 
     // open a broadcast group that listens to awareness and document updates
-    let bcast = Arc::new(BroadcastGroup::new(awareness.clone(), 128).await);
+    let bcast = Arc::new(
+        BroadcastGroup::with_storage(
+            awareness.clone(),
+            128,
+            store.clone(),
+            BroadcastConfig {
+                storage_enabled: true,
+                doc_name: Some(DOC_NAME.to_string()),
+                redis_config: None,
+            },
+        )
+        .await,
+    );
     tracing::info!("Broadcast group initialized");
 
     let app = Router::new()
@@ -78,25 +89,17 @@ async fn main() {
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    axum::extract::State((bcast, store)): axum::extract::State<(
+    axum::extract::State((bcast, _store)): axum::extract::State<(
         Arc<BroadcastGroup>,
         Arc<SqliteStore>,
     )>,
 ) -> Response {
-    ws.on_upgrade(move |socket| peer(socket, bcast, store))
+    ws.on_upgrade(move |socket| handle_socket(socket, bcast))
 }
 
-async fn peer(ws: WebSocket, bcast: Arc<BroadcastGroup>, store: Arc<SqliteStore>) {
-    let (ws_sink, ws_stream) = ws.split();
-    let sink = Arc::new(Mutex::new(WarpSink::from(ws_sink)));
-    let stream = WarpStream::from(ws_stream);
-    let sub = bcast.subscribe(sink, stream);
-    match sub.completed().await {
-        Ok(_) => {
-            tracing::info!("WebSocket connection closed gracefully");
-        }
-        Err(e) => {
-            tracing::error!("WebSocket connection error: {}", e);
-        }
+async fn handle_socket(socket: WebSocket, bcast: Arc<BroadcastGroup>) {
+    let conn = WarpConn::new(bcast, socket);
+    if let Err(e) = conn.await {
+        tracing::error!("WebSocket connection error: {}", e);
     }
 }
