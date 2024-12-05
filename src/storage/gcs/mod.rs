@@ -4,7 +4,6 @@
 
 pub use super::kv as store;
 use super::kv::{DocOps, KVEntry, KVStore};
-use base64::{engine::general_purpose::URL_SAFE, Engine};
 use google_cloud_storage::{
     client::{Client, ClientConfig},
     http::objects::delete::DeleteObjectRequest,
@@ -14,6 +13,7 @@ use google_cloud_storage::{
     http::objects::upload::{Media, UploadObjectRequest, UploadType},
     http::objects::Object,
 };
+use hex;
 use thiserror::Error;
 use tracing::debug;
 
@@ -69,14 +69,6 @@ impl GcsStore {
     pub async fn with_client(client: Client, bucket: String) -> Self {
         Self { client, bucket }
     }
-
-    fn encode_key(&self, key: &[u8]) -> String {
-        URL_SAFE.encode(key)
-    }
-
-    fn decode_key(&self, encoded: &str) -> Vec<u8> {
-        URL_SAFE.decode(encoded).unwrap_or_default()
-    }
 }
 
 impl<'db> DocOps<'db> for GcsStore {}
@@ -88,12 +80,10 @@ impl KVStore for GcsStore {
     type Return = Vec<u8>;
 
     async fn get(&self, key: &[u8]) -> Result<Option<Self::Return>, Self::Error> {
-        let key = self.encode_key(key);
-        debug!("--------------------------------");
-        debug!("Getting from GCS storage - key: {:?}", key);
+        let key_hex = hex::encode(key);
         let request = GetObjectRequest {
             bucket: self.bucket.clone(),
-            object: key,
+            object: key_hex,
             ..Default::default()
         };
 
@@ -108,8 +98,8 @@ impl KVStore for GcsStore {
     }
 
     async fn upsert(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        let key = self.encode_key(key);
-        let upload_type = UploadType::Simple(Media::new(key.clone()));
+        let key_hex = hex::encode(key);
+        let upload_type = UploadType::Simple(Media::new(key_hex));
         let request = UploadObjectRequest {
             bucket: self.bucket.clone(),
             ..Default::default()
@@ -126,10 +116,10 @@ impl KVStore for GcsStore {
     }
 
     async fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let key = self.encode_key(key);
+        let key_hex = hex::encode(key);
         let request = DeleteObjectRequest {
             bucket: self.bucket.clone(),
-            object: key,
+            object: key_hex,
             ..Default::default()
         };
 
@@ -154,11 +144,11 @@ impl KVStore for GcsStore {
             .items
             .unwrap_or_default();
 
-        let from_str = self.encode_key(from);
-        let to_str = self.encode_key(to);
+        let from_hex = hex::encode(from);
+        let to_hex = hex::encode(to);
 
         for obj in objects {
-            if obj.name.as_str() >= from_str.as_str() && obj.name.as_str() <= to_str.as_str() {
+            if obj.name.as_str() >= from_hex.as_str() && obj.name.as_str() <= to_hex.as_str() {
                 let delete_request = DeleteObjectRequest {
                     bucket: self.bucket.clone(),
                     object: obj.name,
@@ -185,15 +175,15 @@ impl KVStore for GcsStore {
             .list_objects(&request)
             .await
             .map_err(GcsError::from)?;
-        let from_str = self.encode_key(from);
-        let to_str = self.encode_key(to);
+        let from_hex = hex::encode(from);
+        let to_hex = hex::encode(to);
 
         let mut objects: Vec<_> = response
             .items
             .unwrap_or_default()
             .into_iter()
             .filter(|obj| {
-                obj.name.as_str() >= from_str.as_str() && obj.name.as_str() <= to_str.as_str()
+                obj.name.as_str() >= from_hex.as_str() && obj.name.as_str() <= to_hex.as_str()
             })
             .collect();
 
@@ -206,7 +196,7 @@ impl KVStore for GcsStore {
     }
 
     async fn peek_back(&self, key: &[u8]) -> Result<Option<Self::Entry>, Self::Error> {
-        let key = self.encode_key(key);
+        let key_hex = hex::encode(key);
         let request = ListObjectsRequest {
             bucket: self.bucket.clone(),
             ..Default::default()
@@ -220,7 +210,7 @@ impl KVStore for GcsStore {
             .items
             .unwrap_or_default()
             .into_iter()
-            .filter(|obj| obj.name.as_str() < key.as_str())
+            .filter(|obj| obj.name.as_str() < key_hex.as_str())
             .collect();
 
         objects.sort_by(|a, b| a.name.cmp(&b.name));
@@ -239,7 +229,7 @@ impl KVStore for GcsStore {
                 .map_err(GcsError::from)?;
 
             Ok(Some(GcsEntry {
-                key: self.decode_key(&obj.name),
+                key: hex::decode(&obj.name).unwrap_or_default(),
                 value,
             }))
         } else {
