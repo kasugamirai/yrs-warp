@@ -4,6 +4,7 @@
 
 pub use super::kv as store;
 use super::kv::{DocOps, KVEntry, KVStore};
+use base64::{engine::general_purpose::URL_SAFE, Engine};
 use google_cloud_storage::{
     client::{Client, ClientConfig},
     http::objects::delete::DeleteObjectRequest,
@@ -14,7 +15,7 @@ use google_cloud_storage::{
     http::objects::Object,
 };
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum GcsError {
@@ -26,8 +27,14 @@ pub enum GcsError {
 /// methods used for convenience when working with Yrs documents.
 pub struct GcsStore {
     #[allow(dead_code)]
-    client: Client,
-    bucket: String,
+    pub client: Client,
+    pub bucket: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GcsConfig {
+    pub bucket_name: String,
+    pub endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for GcsStore {
@@ -45,8 +52,30 @@ impl GcsStore {
         Ok(Self { client, bucket })
     }
 
+    pub async fn new_with_config(config: GcsConfig) -> Result<Self, GcsError> {
+        let mut client_config = ClientConfig::default().anonymous();
+        client_config.storage_endpoint = config
+            .endpoint
+            .unwrap_or_else(|| "http://localhost:4443".to_string());
+
+        let client = Client::new(client_config);
+
+        Ok(Self {
+            client,
+            bucket: config.bucket_name,
+        })
+    }
+
     pub async fn with_client(client: Client, bucket: String) -> Self {
         Self { client, bucket }
+    }
+
+    fn encode_key(&self, key: &[u8]) -> String {
+        URL_SAFE.encode(key)
+    }
+
+    fn decode_key(&self, encoded: &str) -> Vec<u8> {
+        URL_SAFE.decode(encoded).unwrap_or_default()
     }
 }
 
@@ -59,10 +88,12 @@ impl KVStore for GcsStore {
     type Return = Vec<u8>;
 
     async fn get(&self, key: &[u8]) -> Result<Option<Self::Return>, Self::Error> {
-        let key = String::from_utf8_lossy(key);
+        let key = self.encode_key(key);
+        debug!("--------------------------------");
+        debug!("Getting from GCS storage - key: {:?}", key);
         let request = GetObjectRequest {
             bucket: self.bucket.clone(),
-            object: key.to_string(),
+            object: key,
             ..Default::default()
         };
 
@@ -72,20 +103,19 @@ impl KVStore for GcsStore {
             .await
         {
             Ok(data) => Ok(Some(data)),
-            Err(e) if e.to_string().contains("not found") => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
     async fn upsert(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        let key = String::from_utf8_lossy(key);
-        let upload_type = UploadType::Simple(Media::new(key.to_string()));
+        let key = self.encode_key(key);
+        let upload_type = UploadType::Simple(Media::new(key.clone()));
         let request = UploadObjectRequest {
             bucket: self.bucket.clone(),
             ..Default::default()
         };
 
-        info!("Writing to GCS storage - key: {:?}", key);
+        debug!("Writing to GCS storage - key: {:?}", key);
         debug!("Value length: {} bytes", value.len());
 
         self.client
@@ -96,10 +126,10 @@ impl KVStore for GcsStore {
     }
 
     async fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let key = String::from_utf8_lossy(key);
+        let key = self.encode_key(key);
         let request = DeleteObjectRequest {
             bucket: self.bucket.clone(),
-            object: key.to_string(),
+            object: key,
             ..Default::default()
         };
 
@@ -111,10 +141,8 @@ impl KVStore for GcsStore {
     }
 
     async fn remove_range(&self, from: &[u8], to: &[u8]) -> Result<(), Self::Error> {
-        let from = String::from_utf8_lossy(from);
         let request = ListObjectsRequest {
             bucket: self.bucket.clone(),
-            prefix: Some(from.to_string()),
             ..Default::default()
         };
 
@@ -126,10 +154,11 @@ impl KVStore for GcsStore {
             .items
             .unwrap_or_default();
 
-        let to = String::from_utf8_lossy(to);
+        let from_str = self.encode_key(from);
+        let to_str = self.encode_key(to);
 
         for obj in objects {
-            if obj.name.as_str() <= to.as_ref() {
+            if obj.name.as_str() >= from_str.as_str() && obj.name.as_str() <= to_str.as_str() {
                 let delete_request = DeleteObjectRequest {
                     bucket: self.bucket.clone(),
                     object: obj.name,
@@ -146,10 +175,8 @@ impl KVStore for GcsStore {
     }
 
     async fn iter_range(&self, from: &[u8], to: &[u8]) -> Result<Self::Cursor, Self::Error> {
-        let from = String::from_utf8_lossy(from);
         let request = ListObjectsRequest {
             bucket: self.bucket.clone(),
-            prefix: Some(from.to_string()),
             ..Default::default()
         };
 
@@ -158,14 +185,19 @@ impl KVStore for GcsStore {
             .list_objects(&request)
             .await
             .map_err(GcsError::from)?;
-        let to = String::from_utf8_lossy(to);
+        let from_str = self.encode_key(from);
+        let to_str = self.encode_key(to);
 
-        let objects = response
+        let mut objects: Vec<_> = response
             .items
             .unwrap_or_default()
             .into_iter()
-            .filter(|obj| obj.name.as_str() <= to.as_ref())
+            .filter(|obj| {
+                obj.name.as_str() >= from_str.as_str() && obj.name.as_str() <= to_str.as_str()
+            })
             .collect();
+
+        objects.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(GcsRange {
             objects,
@@ -174,10 +206,9 @@ impl KVStore for GcsStore {
     }
 
     async fn peek_back(&self, key: &[u8]) -> Result<Option<Self::Entry>, Self::Error> {
-        let key = String::from_utf8_lossy(key);
+        let key = self.encode_key(key);
         let request = ListObjectsRequest {
             bucket: self.bucket.clone(),
-            prefix: Some(key.to_string()),
             ..Default::default()
         };
 
@@ -189,8 +220,10 @@ impl KVStore for GcsStore {
             .items
             .unwrap_or_default()
             .into_iter()
-            .filter(|obj| obj.name.as_str() < key.as_ref())
+            .filter(|obj| obj.name.as_str() < key.as_str())
             .collect();
+
+        objects.sort_by(|a, b| a.name.cmp(&b.name));
 
         if let Some(obj) = objects.pop() {
             let get_request = GetObjectRequest {
@@ -206,7 +239,7 @@ impl KVStore for GcsStore {
                 .map_err(GcsError::from)?;
 
             Ok(Some(GcsEntry {
-                key: obj.name.into_bytes(),
+                key: self.decode_key(&obj.name),
                 value,
             }))
         } else {
@@ -248,5 +281,115 @@ impl KVEntry for GcsEntry {
     }
     fn value(&self) -> &[u8] {
         &self.value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use google_cloud_storage::http::buckets::insert::{BucketCreationConfig, InsertBucketRequest};
+
+    use super::*;
+
+    async fn ensure_test_bucket(client: &Client, bucket_name: &str) -> Result<(), GcsError> {
+        let bucket = BucketCreationConfig {
+            location: "US".to_string(),
+            ..Default::default()
+        };
+        let request = InsertBucketRequest {
+            name: bucket_name.to_string(),
+            bucket,
+            ..Default::default()
+        };
+
+        match client.insert_bucket(&request).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("already exists") => Ok(()),
+            Err(e) => Err(GcsError::GoogleApi(e)),
+        }
+    }
+
+    async fn create_test_store() -> GcsStore {
+        let config = GcsConfig {
+            bucket_name: "test-bucket".to_string(),
+            endpoint: Some("http://localhost:4443".to_string()),
+        };
+        let store = GcsStore::new_with_config(config).await.unwrap();
+
+        // Ensure bucket exists
+        ensure_test_bucket(&store.client, &store.bucket)
+            .await
+            .unwrap();
+
+        store
+    }
+
+    #[tokio::test]
+    async fn test_basic_operations() {
+        let store = create_test_store().await;
+
+        // Test upsert
+        let key = b"test_key";
+        let value = b"test_value";
+        store.upsert(key, value).await.unwrap();
+
+        // Test get
+        let result = store.get(key).await.unwrap();
+        assert_eq!(result, Some(value.to_vec()));
+
+        // Test get non-existent
+        let result = store.get(b"nonexistent").await.unwrap();
+        assert_eq!(result, None);
+
+        // Test remove
+        store.remove(key).await.unwrap();
+        let result = store.get(key).await;
+        assert!(matches!(
+            result,
+            Err(GcsError::GoogleApi(e)) if e.to_string().contains("404")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_range_operations() {
+        let store = create_test_store().await;
+
+        // Insert test data
+        let test_data = vec![
+            (b"key1".to_vec(), b"value1".to_vec()),
+            (b"key2".to_vec(), b"value2".to_vec()),
+            (b"key3".to_vec(), b"value3".to_vec()),
+        ];
+
+        for (key, value) in &test_data {
+            store.upsert(key, value).await.unwrap();
+        }
+
+        // Test iter_range
+        let range = store.iter_range(b"key1", b"key3").await.unwrap();
+        let entries: Vec<_> = range.collect();
+        assert_eq!(entries.len(), 3);
+
+        // Test remove_range
+        store.remove_range(b"key1", b"key2").await.unwrap();
+
+        // Verify key3 still exists but key1 and key2 are gone
+        assert!(store.get(b"key3").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_peek_back() {
+        let store = create_test_store().await;
+
+        // Insert test data
+        store.upsert(b"key1", b"value1").await.unwrap();
+        store.upsert(b"key2", b"value2").await.unwrap();
+        store.upsert(b"key3", b"value3").await.unwrap();
+
+        // Test peek_back
+        let result = store.peek_back(b"key3").await.unwrap();
+        assert!(result.is_some());
+        let entry = result.unwrap();
+        assert_eq!(entry.key(), b"key2");
+        assert_eq!(entry.value(), b"value2");
     }
 }

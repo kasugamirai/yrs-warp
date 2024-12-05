@@ -1,5 +1,6 @@
 use crate::storage::kv::DocOps;
-use crate::storage::sqlite::SqliteStore;
+//use crate::storage::sqlite::SqliteStore;
+use crate::storage::gcs::GcsStore;
 use crate::AwarenessRef;
 use futures_util::{SinkExt, StreamExt};
 use redis::aio::MultiplexedConnection as RedisConnection;
@@ -43,7 +44,7 @@ pub struct BroadcastGroup {
     awareness_updater: JoinHandle<()>,
     doc_sub: Option<yrs::Subscription>,
     awareness_sub: Option<yrs::Subscription>,
-    storage: Option<Arc<SqliteStore>>,
+    storage: Option<Arc<GcsStore>>,
     redis: Option<Arc<Mutex<RedisConnection>>>,
     doc_name: Option<String>,
     redis_ttl: Option<usize>,
@@ -138,7 +139,7 @@ impl BroadcastGroup {
     pub async fn with_storage(
         awareness: AwarenessRef,
         buffer_capacity: usize,
-        store: Arc<SqliteStore>,
+        store: Arc<GcsStore>,
         config: BroadcastConfig,
     ) -> Self {
         if !config.storage_enabled {
@@ -223,7 +224,7 @@ impl BroadcastGroup {
         Ok(())
     }
 
-    async fn load_from_storage(store: &Arc<SqliteStore>, doc_name: &str, awareness: &AwarenessRef) {
+    async fn load_from_storage(store: &Arc<GcsStore>, doc_name: &str, awareness: &AwarenessRef) {
         let awareness = awareness.write().await;
         let mut txn = awareness.doc().transact_mut();
         match store.load_doc(doc_name, &mut txn).await {
@@ -239,14 +240,16 @@ impl BroadcastGroup {
     async fn handle_update(
         update: Vec<u8>,
         doc_name: &str,
-        store: &Arc<SqliteStore>,
+        store: &Arc<GcsStore>,
         redis: &Option<Arc<Mutex<RedisConnection>>>,
         redis_ttl: Option<usize>,
     ) {
         // Store in persistent storage
-        if let Err(e) = store.push_update(doc_name, &update).await {
-            tracing::error!("Failed to store update: {}", e);
-            return;
+        let ret = store.push_update(doc_name, &update).await;
+        if let Err(e) = ret {
+            tracing::error!("Failed to store update in GCS: {}", e);
+        } else {
+            tracing::debug!("Successfully stored update in GCS {:?}", ret);
         }
 
         // Update Redis cache if enabled

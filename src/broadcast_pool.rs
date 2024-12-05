@@ -1,21 +1,22 @@
 use crate::broadcast::{BroadcastConfig, BroadcastGroup, RedisConfig};
 use crate::storage::kv::DocOps;
-use crate::storage::sqlite::SqliteStore;
+//use crate::storage::sqlite::SqliteStore;
+use crate::storage::gcs::GcsStore;
 use crate::AwarenessRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use yrs::sync::Awareness;
-use yrs::{Doc, Text, Transact};
+use yrs::{doc, Doc, Text, Transact};
 
 pub struct BroadcastPool {
-    store: Arc<SqliteStore>,
+    store: Arc<GcsStore>,
     redis_config: RedisConfig,
     groups: RwLock<HashMap<String, Arc<BroadcastGroup>>>,
 }
 
 impl BroadcastPool {
-    pub fn new(store: Arc<SqliteStore>, redis_config: RedisConfig) -> Self {
+    pub fn new(store: Arc<GcsStore>, redis_config: RedisConfig) -> Self {
         Self {
             store,
             redis_config,
@@ -52,15 +53,6 @@ impl BroadcastPool {
                             doc_id,
                             e
                         );
-                        // Initialize new document
-                        let txt = doc.get_or_insert_text("codemirror");
-                        txt.push(
-                            &mut txn,
-                            r#"function hello() {
-  console.log('hello world');
-}"#,
-                        );
-                        tracing::info!("Initialized new document: {}", doc_id);
                     }
                 }
             }
