@@ -13,7 +13,6 @@ use google_cloud_storage::{
     http::objects::upload::{Media, UploadObjectRequest, UploadType},
     http::objects::Object,
 };
-use hex;
 use thiserror::Error;
 use tracing::debug;
 
@@ -69,6 +68,27 @@ impl GcsStore {
     pub async fn with_client(client: Client, bucket: String) -> Self {
         Self { client, bucket }
     }
+
+    fn bytes_to_string(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|&x| format!("{:02}", x)) // 使用固定2位数字格式
+            .collect()
+    }
+
+    fn string_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2) // 每次处理2个字符
+            .filter_map(|i| {
+                if i + 2 <= s.len() {
+                    // 将2位数字字符串转换为u8
+                    s[i..i + 2].parse::<u8>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl<'db> DocOps<'db> for GcsStore {}
@@ -80,7 +100,7 @@ impl KVStore for GcsStore {
     type Return = Vec<u8>;
 
     async fn get(&self, key: &[u8]) -> Result<Option<Self::Return>, Self::Error> {
-        let key_hex = hex::encode(key);
+        let key_hex = Self::bytes_to_string(key);
         let request = GetObjectRequest {
             bucket: self.bucket.clone(),
             object: key_hex,
@@ -93,12 +113,13 @@ impl KVStore for GcsStore {
             .await
         {
             Ok(data) => Ok(Some(data)),
+            Err(e) if e.to_string().contains("404") => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
     async fn upsert(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        let key_hex = hex::encode(key);
+        let key_hex = Self::bytes_to_string(key);
         let upload_type = UploadType::Simple(Media::new(key_hex));
         let request = UploadObjectRequest {
             bucket: self.bucket.clone(),
@@ -116,7 +137,7 @@ impl KVStore for GcsStore {
     }
 
     async fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let key_hex = hex::encode(key);
+        let key_hex = Self::bytes_to_string(key);
         let request = DeleteObjectRequest {
             bucket: self.bucket.clone(),
             object: key_hex,
@@ -125,7 +146,7 @@ impl KVStore for GcsStore {
 
         match self.client.delete_object(&request).await {
             Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("not found") => Ok(()),
+            Err(e) if e.to_string().contains("404") => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -144,8 +165,8 @@ impl KVStore for GcsStore {
             .items
             .unwrap_or_default();
 
-        let from_hex = hex::encode(from);
-        let to_hex = hex::encode(to);
+        let from_hex = Self::bytes_to_string(from);
+        let to_hex = Self::bytes_to_string(to);
 
         for obj in objects {
             if obj.name.as_str() >= from_hex.as_str() && obj.name.as_str() <= to_hex.as_str() {
@@ -175,8 +196,8 @@ impl KVStore for GcsStore {
             .list_objects(&request)
             .await
             .map_err(GcsError::from)?;
-        let from_hex = hex::encode(from);
-        let to_hex = hex::encode(to);
+        let from_hex = Self::bytes_to_string(from);
+        let to_hex = Self::bytes_to_string(to);
 
         let mut objects: Vec<_> = response
             .items
@@ -196,7 +217,7 @@ impl KVStore for GcsStore {
     }
 
     async fn peek_back(&self, key: &[u8]) -> Result<Option<Self::Entry>, Self::Error> {
-        let key_hex = hex::encode(key);
+        let key_hex = Self::bytes_to_string(key);
         let request = ListObjectsRequest {
             bucket: self.bucket.clone(),
             ..Default::default()
@@ -229,7 +250,7 @@ impl KVStore for GcsStore {
                 .map_err(GcsError::from)?;
 
             Ok(Some(GcsEntry {
-                key: hex::decode(&obj.name).unwrap_or_default(),
+                key: Self::string_to_bytes(&obj.name),
                 value,
             }))
         } else {
